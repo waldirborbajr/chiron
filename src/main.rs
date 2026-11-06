@@ -28,16 +28,17 @@ struct QuestionRequest {
 struct AnswerResponse {
     answer: String,
     strategy: String,
+    model: String,
 }
 
 // ============================================================
-// Runtime Strategy Selection
+// Model Selection
 // ============================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Strategy {
-    Candle, // Modelo original (safetensors) — ~2GB+ RAM
-    Gguf,   // Modelo quantizado via llama-server — ~0.9GB RAM
+    Candle, // In-process (Qwen 1.5B original)
+    Gguf,   // Delegated to llama-server (SmolLM2 or Qwen 0.5B)
 }
 
 impl Strategy {
@@ -49,7 +50,50 @@ impl Strategy {
     }
 }
 
-fn choose_strategy() -> Strategy {
+#[derive(Debug, Clone)]
+struct ModelConfig {
+    strategy: Strategy,
+    /// Nome amigável para logs e resposta da API
+    name: &'static str,
+    /// Repositório HF (para download no notebook) — usado apenas em logs no runtime
+    hf_repo: &'static str,
+    /// Nome do arquivo GGUF (se strategy == Gguf)
+    gguf_filename: Option<&'static str>,
+    /// RAM mínima total necessária (GB) para escolher este modelo
+    min_ram_gb: f64,
+}
+
+const MODEL_SMOLLM2: ModelConfig = ModelConfig {
+    strategy: Strategy::Gguf,
+    name: "SmolLM2-360M-Instruct-Q4_K_M",
+    hf_repo: "bartowski/SmolLM2-360M-Instruct-GGUF",
+    gguf_filename: Some("SmolLM2-360M-Instruct-Q4_K_M.gguf"),
+    min_ram_gb: 0.0,
+};
+
+const MODEL_QWEN_05B: ModelConfig = ModelConfig {
+    strategy: Strategy::Gguf,
+    name: "Qwen2.5-0.5B-Instruct-Q4_K_M",
+    hf_repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    gguf_filename: Some("qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+    min_ram_gb: 1.0,
+};
+
+const MODEL_QWEN_15B: ModelConfig = ModelConfig {
+    strategy: Strategy::Candle,
+    name: "Qwen2.5-1.5B-Instruct (safetensors)",
+    hf_repo: "Qwen/Qwen2.5-1.5B-Instruct",
+    gguf_filename: None,
+    min_ram_gb: 2.5,
+};
+
+/// Seleciona o melhor modelo com base na RAM total do dispositivo.
+///
+/// Ordem de preferência (do mais leve ao mais pesado):
+/// 1. SmolLM2-360M  (sempre fallback)
+/// 2. Qwen2.5-0.5B  (se RAM >= 1.0 GB)
+/// 3. Qwen2.5-1.5B  (se RAM >= 2.5 GB, via Candle)
+fn select_model() -> ModelConfig {
     let mut sys = System::new_all();
     sys.refresh_all();
 
@@ -57,16 +101,20 @@ fn choose_strategy() -> Strategy {
     let available_ram_gb = sys.available_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
 
     println!(
-        "[strategy] Total RAM: {:.2} GB | Available RAM: {:.2} GB",
+        "[select] Total RAM: {:.2} GB | Available RAM: {:.2} GB",
         total_ram_gb, available_ram_gb
     );
 
-    if total_ram_gb < 1.5 {
-        println!("[strategy] Low RAM detected. Choosing GGUF (via llama-server).");
-        Strategy::Gguf
+    // Tenta do mais pesado para o mais leve
+    if total_ram_gb >= MODEL_QWEN_15B.min_ram_gb {
+        println!("[select] Selected: {} (Candle, in-process)", MODEL_QWEN_15B.name);
+        MODEL_QWEN_15B
+    } else if total_ram_gb >= MODEL_QWEN_05B.min_ram_gb {
+        println!("[select] Selected: {} (GGUF via llama-server)", MODEL_QWEN_05B.name);
+        MODEL_QWEN_05B
     } else {
-        println!("[strategy] Sufficient RAM. Choosing Candle (original model).");
-        Strategy::Candle
+        println!("[select] Low RAM. Selected: {} (GGUF via llama-server)", MODEL_SMOLLM2.name);
+        MODEL_SMOLLM2
     }
 }
 
@@ -75,8 +123,8 @@ fn choose_strategy() -> Strategy {
 // ============================================================
 
 struct AppState {
-    strategy: Strategy,
-    tokenizer: Option<Tokenizer>,
+    config: ModelConfig,
+    tokenizer: Option<Tokenizer>, // Apenas para Candle
     device: Device,
     candle_model: Option<ModelForCausalLM>,
     llama_server_url: String,
@@ -84,7 +132,7 @@ struct AppState {
 }
 
 // ============================================================
-// Candle Inference (in-process)
+// Candle Inference (in-process, only for Qwen 1.5B)
 // ============================================================
 
 fn generate_with_candle(
@@ -131,7 +179,7 @@ fn generate_with_candle(
 }
 
 // ============================================================
-// GGUF Inference (delegated to llama-server over HTTP)
+// GGUF Inference (delegated to llama-server)
 // ============================================================
 
 #[derive(Serialize)]
@@ -226,9 +274,10 @@ async fn handle_question(
     let max_new_tokens = 50;
     let temperature = 0.3;
 
-    let strategy_str = state_guard.strategy.as_str().to_string();
+    let strategy_str = state_guard.config.strategy.as_str().to_string();
+    let model_str = state_guard.config.name.to_string();
 
-    let result: Result<String> = match state_guard.strategy {
+    let result: Result<String> = match state_guard.config.strategy {
         Strategy::Candle => {
             let tokenizer = match state_guard.tokenizer.as_ref() {
                 Some(t) => t,
@@ -238,6 +287,7 @@ async fn handle_question(
                         Json(AnswerResponse {
                             answer: "Tokenizer not loaded".to_string(),
                             strategy: strategy_str,
+                            model: model_str,
                         }),
                     )
                 }
@@ -274,6 +324,7 @@ async fn handle_question(
             Json(AnswerResponse {
                 answer,
                 strategy: strategy_str,
+                model: model_str,
             }),
         ),
         Err(e) => (
@@ -281,6 +332,7 @@ async fn handle_question(
             Json(AnswerResponse {
                 answer: format!("Generation error: {}", e),
                 strategy: strategy_str,
+                model: model_str,
             }),
         ),
     }
@@ -292,21 +344,21 @@ async fn handle_question(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let strategy = choose_strategy();
+    // 1. Seleciona modelo com base na RAM
+    let config = select_model();
     let device = Device::Cpu;
     let http_client = reqwest::Client::new();
 
-    // URL do llama-server (configurável via env var)
     let llama_server_url = std::env::var("LLAMA_SERVER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 
-    // Tokenizer e modelo dependem da estratégia
-    let (tokenizer, candle_model) = match strategy {
+    // 2. Carrega recursos conforme a estratégia
+    let (tokenizer, candle_model) = match config.strategy {
         Strategy::Candle => {
-            println!("[init] Loading tokenizer and Candle model (safetensors)...");
+            println!("[init] Loading Candle model (safetensors)...");
             let api = Api::new()?;
             let repo = api.repo(Repo::new(
-                "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
+                config.hf_repo.to_string(),
                 RepoType::Model,
             ));
 
@@ -316,7 +368,7 @@ async fn main() -> Result<()> {
 
             let tokenizer =
                 Tokenizer::from_file(tokenizer_filename).map_err(Error::msg)?;
-            let config: Config =
+            let model_config: Config =
                 serde_json::from_slice(&std::fs::read(config_filename)?)?;
 
             let vb = unsafe {
@@ -326,18 +378,18 @@ async fn main() -> Result<()> {
                     &device,
                 )?
             };
-            let model = ModelForCausalLM::new(&config, vb)?;
+            let model = ModelForCausalLM::new(&model_config, vb)?;
 
             println!("[init] Candle model loaded.");
             (Some(tokenizer), Some(model))
         }
         Strategy::Gguf => {
             println!(
-                "[init] GGUF strategy selected. Will delegate to llama-server at {}",
-                llama_server_url
+                "[init] GGUF strategy. Expecting llama-server at {} with model: {}",
+                llama_server_url, config.name
             );
 
-            // Health check do llama-server
+            // Health check
             match http_client
                 .get(format!("{}/health", llama_server_url))
                 .send()
@@ -348,16 +400,14 @@ async fn main() -> Result<()> {
                 }
                 Ok(resp) => {
                     eprintln!(
-                        "[init] WARNING: llama-server returned status {} at {}. \
-                         Make sure it is running before sending requests.",
+                        "[init] WARNING: llama-server returned {} at {}",
                         resp.status(),
                         llama_server_url
                     );
                 }
                 Err(e) => {
                     eprintln!(
-                        "[init] WARNING: could not reach llama-server at {}: {}. \
-                         Start it with: llama-server -m model.gguf --port 8080",
+                        "[init] WARNING: could not reach llama-server at {}: {}",
                         llama_server_url, e
                     );
                 }
@@ -367,8 +417,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    // 3. Monta estado compartilhado
     let shared_state = Arc::new(Mutex::new(AppState {
-        strategy,
+        config: config.clone(),
         tokenizer,
         device,
         candle_model,
@@ -376,14 +427,16 @@ async fn main() -> Result<()> {
         http_client,
     }));
 
+    // 4. Rotas
     let app = Router::new()
         .route("/chiron", post(handle_question))
         .with_state(shared_state);
 
+    // 5. Servidor
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3030").await.unwrap();
     println!(
-        "[server] Running at http://0.0.0.0:3030 (strategy: {:?})",
-        strategy
+        "[server] Running at http://0.0.0.0:3030 | strategy={:?} | model={}",
+        config.strategy, config.name
     );
     axum::serve(listener, app).await.unwrap();
 
