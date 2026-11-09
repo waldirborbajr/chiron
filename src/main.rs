@@ -8,7 +8,8 @@ use axum::{
 };
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::models::qwen2::{Config, ModelForCausalLM};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use sysinfo::System;
@@ -339,6 +340,42 @@ async fn handle_question(
 }
 
 // ============================================================
+// HuggingFace download (sem hf-hub: evita native-tls/OpenSSL)
+// ============================================================
+
+/// Baixa `file` de `repo` (HuggingFace, branch main) para um cache local
+/// em $HOME/.cache/chiron/<repo>/<file>. Se já existir, reutiliza.
+async fn hf_download(client: &reqwest::Client, repo: &str, file: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dest = PathBuf::from(home)
+        .join(".cache/chiron")
+        .join(repo)
+        .join(file);
+
+    if dest.exists() {
+        return Ok(dest);
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+    println!("[init] Baixando {url}");
+    let mut resp = client.get(&url).send().await?.error_for_status()?;
+
+    // Escreve em partes (chunk) para não carregar o arquivo inteiro na RAM.
+    let tmp = dest.with_extension("part");
+    let mut out = tokio::fs::File::create(&tmp).await?;
+    while let Some(chunk) = resp.chunk().await? {
+        out.write_all(&chunk).await?;
+    }
+    out.flush().await?;
+    drop(out);
+    tokio::fs::rename(&tmp, &dest).await?;
+    Ok(dest)
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -356,15 +393,12 @@ async fn main() -> Result<()> {
     let (tokenizer, candle_model) = match config.strategy {
         Strategy::Candle => {
             println!("[init] Loading Candle model (safetensors)...");
-            let api = Api::new()?;
-            let repo = api.repo(Repo::new(
-                config.hf_repo.to_string(),
-                RepoType::Model,
-            ));
-
-            let tokenizer_filename = repo.get("tokenizer.json")?;
-            let config_filename = repo.get("config.json")?;
-            let weights_filename = repo.get("model.safetensors")?;
+            let tokenizer_filename =
+                hf_download(&http_client, config.hf_repo, "tokenizer.json").await?;
+            let config_filename =
+                hf_download(&http_client, config.hf_repo, "config.json").await?;
+            let weights_filename =
+                hf_download(&http_client, config.hf_repo, "model.safetensors").await?;
 
             let tokenizer =
                 Tokenizer::from_file(tokenizer_filename).map_err(Error::msg)?;

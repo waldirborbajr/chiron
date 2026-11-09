@@ -9,6 +9,9 @@
 #   just build-llama      # llama.cpp cross-compilado para Raspi
 #   just download-models  # baixa SmolLM2 + Qwen 0.5B GGUF no notebook
 #   just package-all-raspi # empacota TUDO para o Raspi (API + llama + modelos)
+#   just fmt              # formata o código (rustfmt)
+#   just clippy           # lint com clippy
+#   just fix              # aplica correções do clippy/compilador e formata
 #
 # Variáveis configuráveis via env:
 #   ANDROID_NDK_HOME  — caminho do Android NDK
@@ -142,7 +145,26 @@ package-all-raspi: build-raspi build-llama download-models
     @echo "      - models/{{qwen05b_file}}"
 
 # ============================================================
-# 6. Utilitários
+# 6. Qualidade de código
+# ============================================================
+
+# Formata o código (clippy não formata; quem formata é o rustfmt)
+fmt:
+    cargo fmt --all
+
+# Lint com clippy
+clippy:
+    cargo clippy --all-targets
+
+# Aplica as correções automáticas do clippy/compilador e depois formata.
+# --allow-dirty/--allow-staged: sem eles o cargo se recusa a corrigir com
+# alterações não commitadas no git.
+fix:
+    cargo clippy --fix --allow-dirty --allow-staged --all-targets
+    cargo fmt --all
+
+# ============================================================
+# 7. Utilitários
 # ============================================================
 
 check-toolchain:
