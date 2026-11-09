@@ -87,13 +87,13 @@ build-llama:
         git -C {{llama_src_dir}} pull --ff-only; \
     fi
     @echo "==> Configurando CMake para cross-compile"
-    cmake -B {{llama_build_dir}} -S {{llama_src_dir}} -G Ninja \
+    cmake -B {{llama_build_dir}} -S {{llama_src_dir}} \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_SYSTEM_NAME=Linux \
         -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
         -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
-    @ninja -C {{llama_build_dir}} -j$(nproc)
+    @cmake --build {{llama_build_dir}} -j$(nproc)
     @ls -lh {{llama_build_dir}}/bin/llama-server
 
 # ============================================================
@@ -170,7 +170,7 @@ fix:
 check-toolchain:
     @command -v rustc >/dev/null || (echo "FALTA: rustc"; exit 1)
     @command -v cmake >/dev/null || (echo "FALTA: cmake"; exit 1)
-    @command -v ninja >/dev/null || (echo "FALTA: ninja"; exit 1)
+    @command -v make >/dev/null || (echo "FALTA: make"; exit 1)
     @command -v aarch64-linux-gnu-gcc >/dev/null || (echo "FALTA: aarch64-linux-gnu-gcc"; exit 1)
     @echo "==> Toolchain OK"
 
