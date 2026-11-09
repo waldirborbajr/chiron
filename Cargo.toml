@@ -6,18 +6,23 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 axum = "0.7"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-candle-core = "0.4.0"
-candle-transformers = "0.4.0"
-tokenizers = "0.15.0"
+
+# Candle: 0.4.x quebra com half >= 2.5 (f16: SampleUniform). 0.10 corrige
+# e compila em Rust 1.91 (o 0.11.1 exige um rustc mais novo no x86_64).
+# candle-nn é necessário para o VarBuilder (qwen2 não o reexporta).
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+
+# Sem features padrão: remove esaxx_fast (C++) e progressbar, desnecessários
+# para inferência e que complicam o cross-compile. onig = regex do tokenizer.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
 sysinfo = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Opcional: para suporte a GGUF via Candle.
-# Descomente se quiser usar o caminho GGUF.
-# candelabra = "0.1"
 
 [profile.release]
 opt-level = 1
